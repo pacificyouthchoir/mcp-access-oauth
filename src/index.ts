@@ -19,11 +19,7 @@ const ENSEMBLE_BY_GROUP_ID: Record<number, string> = (() => {
   }
   return m;
 })();
-
-// Evergreen: tuition = registration templates in the "Annual Enrollment" category.
-// Old seasons age out to _Archive; new ones land here automatically. No yearly edits.
 const ANNUAL_ENROLLMENT_CATEGORY_ID = 305;
-
 const orIds = (field: string, ids: number[]) => ids.slice(0, 50).map((id) => `${field} == ${id}`).join(" || ");
 const sum = (a: any[], f: (x: any) => number) => a.reduce((t, x) => t + (Number(f(x)) || 0), 0);
 
@@ -37,7 +33,6 @@ async function rockSearch(env: RockEnv, entity: string, body: unknown): Promise<
   const data: any = await res.json();
   return Array.isArray(data) ? data : (data.items ?? data.Items ?? []);
 }
-
 async function resolvePerson(env: RockEnv, query: string) {
   const q = query.replace(/["\\]/g, "").trim();
   return rockSearch(env, "people", {
@@ -125,17 +120,15 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
       },
     );
 
-    // --- Tool 4: tuition balance (category-driven / evergreen) ---
+    // --- Tool 4: tuition balance + payment-plan health (evergreen) ---
     // VALIDATE against Singer Dashboard before trusting the numbers.
     this.server.tool(
       "rock_get_tuition_balance",
-      "Compute a PYC family's tuition balance (total due minus payments). Read-only. Discovers tuition registrations by the Annual Enrollment template category, so new seasons work automatically. Matches a person as parent/registrar or singer/registrant.",
+      "Compute a PYC family's tuition balance (total due minus payments), including payment-plan details when present. Read-only. Discovers tuition templates by the Annual Enrollment category (new seasons auto-included). Matches a person as parent/registrar or singer/registrant.",
       { query: z.string().min(2).describe("Name or email of a family member (parent or singer)") },
       async ({ query }) => {
         try {
           const env = this.env as unknown as RockEnv;
-
-          // 0) discover current tuition templates by category (evergreen)
           const templates = await rockSearch(env, "registrationtemplates", { where: `CategoryId == ${ANNUAL_ENROLLMENT_CATEGORY_ID}`, select: "new { Id, Name }", limit: 50 });
           const templateIds = templates.map((t) => t.id).filter(Boolean);
           const templateName: Record<number, string> = {};
@@ -159,7 +152,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 
           const regs: any[] = [];
           for (let i = 0; i < regIds.length; i += 50)
-            regs.push(...(await rockSearch(env, "registrations", { where: `(${orIds("Id", regIds.slice(i, i + 50))}) && (${orIds("RegistrationTemplateId", templateIds)})`, select: "new { Id, RegistrationTemplateId, DiscountAmount, DiscountPercentage, FirstName, LastName }", limit: 100 })));
+            regs.push(...(await rockSearch(env, "registrations", { where: `(${orIds("Id", regIds.slice(i, i + 50))}) && (${orIds("RegistrationTemplateId", templateIds)})`, select: "new { Id, RegistrationTemplateId, DiscountAmount, DiscountPercentage, FirstName, LastName, PaymentPlanFinancialScheduledTransactionId }", limit: 100 })));
           if (regs.length === 0) return { content: [{ text: `No current tuition registrations found for ${name}.`, type: "text" }] };
 
           const etype = await rockSearch(env, "entitytypes", { where: `Name == "Rock.Model.Registration"`, select: "new { Id }", limit: 1 });
@@ -187,9 +180,33 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
             }
             const balance = totalDue - paid;
             familyBalance += balance;
+
+            // payment plan follow-through
+            let planLine = "";
+            const planId = reg.paymentPlanFinancialScheduledTransactionId;
+            if (planId) {
+              try {
+                const st = (await rockSearch(env, "financialscheduledtransactions", { where: `Id == ${planId}`, select: "new { NumberOfPayments, NextPaymentDate, TransactionFrequencyValueId, IsActive }", limit: 1 }))[0];
+                const pd = await rockSearch(env, "financialscheduledtransactiondetails", { where: `ScheduledTransactionId == ${planId}`, select: "new { Amount }", limit: 50 });
+                const perPayment = sum(pd, (d) => d.amount);
+                let freq = "";
+                try {
+                  if (st?.transactionFrequencyValueId) {
+                    const dv = (await rockSearch(env, "definedvalues", { where: `Id == ${st.transactionFrequencyValueId}`, select: "new { Value }", limit: 1 }))[0];
+                    if (dv?.value) freq = ` ${String(dv.value).toLowerCase()}`;
+                  }
+                } catch {}
+                const next = st?.nextPaymentDate ? String(st.nextPaymentDate).slice(0, 10) : null;
+                const overdue = next && st?.isActive && new Date(st.nextPaymentDate).getTime() < Date.now() ? " ⚠ next payment appears overdue — verify in Rock" : "";
+                planLine = `\n   ↳ payment plan (${st?.isActive ? "active" : "inactive"}): $${perPayment.toFixed(2)}${freq}, ${st?.numberOfPayments ?? "?"} payments${next ? `, next due ${next}` : ""}${overdue}`;
+              } catch (e: any) {
+                planLine = `\n   ↳ on a payment plan (plan details unavailable: ${e.message})`;
+              }
+            }
+
             const label = templateName[reg.registrationTemplateId] || `template ${reg.registrationTemplateId}`;
             const paidFull = balance <= 5 ? " ✓ paid in full" : "";
-            out.push(`• Reg ${reg.id} — ${label} (${reg.firstName || ""} ${reg.lastName || ""}): due $${totalDue.toFixed(2)}, paid $${paid.toFixed(2)}, balance $${balance.toFixed(2)}${paidFull}`);
+            out.push(`• Reg ${reg.id} — ${label} (${reg.firstName || ""} ${reg.lastName || ""}): due $${totalDue.toFixed(2)}, paid $${paid.toFixed(2)}, balance $${balance.toFixed(2)}${paidFull}${planLine}`);
           }
           return { content: [{ text: `Tuition for ${name}:\n${out.join("\n")}\n\nFamily balance: $${familyBalance.toFixed(2)}`, type: "text" }] };
         } catch (e: any) { return { content: [{ text: `Error getting tuition balance: ${e.message}`, type: "text" }] }; }
