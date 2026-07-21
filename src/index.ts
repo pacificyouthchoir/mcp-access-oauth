@@ -5,64 +5,99 @@ import { z } from "zod";
 import { handleAccessRequest } from "./access-handler";
 import type { Props } from "./workers-oauth-utils";
 
-const ALLOWED_EMAILS = new Set(["<INSERT EMAIL>"]);
+// --- Rock REST client -------------------------------------------------------
+async function rockFindPeople(
+  env: { ROCK_BASE_URL: string; ROCK_API_KEY: string },
+  query: string,
+  limit: number,
+): Promise<any[]> {
+  const q = query.replace(/["\\]/g, "").trim();
+  const body = {
+    where:
+      `FirstName.Contains("${q}") ` +
+      `|| LastName.Contains("${q}") ` +
+      `|| NickName.Contains("${q}") ` +
+      `|| Email.Contains("${q}")`,
+    select: "new { Id, FirstName, LastName, NickName, Email }",
+    sort: "LastName, FirstName",
+    limit,
+  };
+  const res = await fetch(`${env.ROCK_BASE_URL}/api/v2/models/people/search`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization-Token": env.ROCK_API_KEY,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Rock API ${res.status}: ${text.slice(0, 300)}`);
+  }
+  const data: any = await res.json();
+  return Array.isArray(data) ? data : (data.items ?? data.Items ?? []);
+}
 
 export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
-	server = new McpServer({
-		name: "Access OAuth Proxy Demo",
-		version: "1.0.0",
-	});
+  server = new McpServer({
+    name: "PYC Rock MCP",
+    version: "1.0.0",
+  });
 
-	async init() {
-		// Hello, world!
-		this.server.tool(
-			"add",
-			"Add two numbers the way only MCP can",
-			{ a: z.number(), b: z.number() },
-			async ({ a, b }) => ({
-				content: [{ text: String(a + b), type: "text" }],
-			}),
-		);
-
-		// Dynamically add tools based on the user's login. In this case, I want to limit
-		// access to my Image Generation tool to just me
-		if (ALLOWED_EMAILS.has(this.props!.email)) {
-			this.server.tool(
-				"generateImage",
-				"Generate an image using the `flux-1-schnell` model. Works best with 8 steps.",
-				{
-					prompt: z
-						.string()
-						.describe("A text description of the image you want to generate."),
-					steps: z
-						.number()
-						.min(4)
-						.max(8)
-						.default(4)
-						.describe(
-							"The number of diffusion steps; higher values can improve quality but take longer. Must be between 4 and 8, inclusive.",
-						),
-				},
-				async ({ prompt, steps }) => {
-					const response = await this.env.AI.run("@cf/black-forest-labs/flux-1-schnell", {
-						prompt,
-						steps,
-					});
-
-					return {
-						content: [{ data: response.image!, mimeType: "image/jpeg", type: "image" }],
-					};
-				},
-			);
-		}
-	}
+  async init() {
+    this.server.tool(
+      "rock_find_person",
+      "Search Pacific Youth Choir's Rock database for people by name or email fragment. Read-only. Returns matching people with their Rock Id, name, nickname, and email.",
+      {
+        query: z
+          .string()
+          .min(2)
+          .describe("Name or email fragment, e.g. 'Hansen' or 'chris@'"),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(50)
+          .default(10)
+          .describe("Max number of people to return (default 10)"),
+      },
+      async ({ query, limit }) => {
+        try {
+          const env = this.env as unknown as {
+            ROCK_BASE_URL: string;
+            ROCK_API_KEY: string;
+          };
+          const people = await rockFindPeople(env, query, limit ?? 10);
+          if (people.length === 0) {
+            return {
+              content: [{ text: `No people found matching "${query}".`, type: "text" }],
+            };
+          }
+          const lines = people.map((p) => {
+            const name = `${p.nickName || p.firstName || ""} ${p.lastName || ""}`.trim();
+            return `- ${name} (Id ${p.id})${p.email ? ` — ${p.email}` : ""}`;
+          });
+          return {
+            content: [
+              {
+                text: `Found ${people.length} match(es) for "${query}":\n${lines.join("\n")}`,
+                type: "text",
+              },
+            ],
+          };
+        } catch (err: any) {
+          return { content: [{ text: `Error searching Rock: ${err.message}`, type: "text" }] };
+        }
+      },
+    );
+  }
 }
 
 export default new OAuthProvider({
-	apiHandler: MyMCP.serve("/mcp"),
-	apiRoute: "/mcp",
-	authorizeEndpoint: "/authorize",
-	clientRegistrationEndpoint: "/register",
-	defaultHandler: { fetch: handleAccessRequest as any },
-	tokenEndpoint: "/token",
+  apiHandler: MyMCP.serve("/mcp"),
+  apiRoute: "/mcp",
+  authorizeEndpoint: "/authorize",
+  clientRegistrationEndpoint: "/register",
+  defaultHandler: { fetch: handleAccessRequest as any },
+  tokenEndpoint: "/token",
 });
