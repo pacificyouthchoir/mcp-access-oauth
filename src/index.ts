@@ -13,7 +13,6 @@ const GROUP_IDS: Record<string, Record<string, number>> = {
   "24": { "nova 1": 9322, "nova 2": 9323, cascadia: 9324, pacific: 9325, chamber: 9326 },
 };
 
-// --- shared Rock entity-search client ---------------------------------------
 async function rockSearch(env: RockEnv, entity: string, body: unknown): Promise<any[]> {
   const res = await fetch(`${env.ROCK_BASE_URL}/api/v2/models/${entity}/search`, {
     method: "POST",
@@ -72,18 +71,15 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
       },
     );
 
-    // --- Tool 2: get an ensemble roster ----------------------------------
+    // --- Tool 2: get an ensemble roster (two-step) -----------------------
     this.server.tool(
       "rock_get_roster",
-      "Get the active roster (singers) of a Pacific Youth Choir ensemble for a season. Read-only. Returns each member's name, email, and role.",
+      "Get the active roster (singers) of a Pacific Youth Choir ensemble for a season. Read-only. Returns each member's name and email.",
       {
         ensemble: z
           .enum(["Nova 1", "Nova 2", "Cascadia", "Pacific", "Chamber"])
           .describe("Which ensemble's roster to pull"),
-        season: z
-          .enum(["23", "24"])
-          .default("24")
-          .describe("Season: '23' = 2025-26, '24' = 2026-27 (default current)"),
+        season: z.enum(["23", "24"]).default("24").describe("'23' = 2025-26, '24' = 2026-27 (default)"),
       },
       async ({ ensemble, season }) => {
         try {
@@ -91,22 +87,37 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
           const groupId = GROUP_IDS[season]?.[ensemble.toLowerCase()];
           if (!groupId)
             return { content: [{ text: `No group ID known for ${ensemble}, season ${season}.`, type: "text" }] };
+
+          // Step 1: active, non-archived member PersonIds in the group
           const members = await rockSearch(env, "groupmembers", {
             where: `GroupId == ${groupId} && GroupMemberStatus == 1 && IsArchived == false`,
-            select:
-              "new { PersonId, NickName = Person.NickName, LastName = Person.LastName, Email = Person.Email, Role = GroupRole.Name }",
-            sort: "Person.LastName, Person.NickName",
+            select: "new { PersonId }",
             limit: 300,
           });
-          if (members.length === 0)
+          const ids = [...new Set(members.map((m) => m.personId).filter(Boolean))];
+          if (ids.length === 0)
             return { content: [{ text: `No active members found in ${ensemble} (season ${season}).`, type: "text" }] };
-          const lines = members.map((m) => {
-            const name = `${m.nickName || ""} ${m.lastName || ""}`.trim();
-            return `- ${name}${m.role ? ` [${m.role}]` : ""}${m.email ? ` — ${m.email}` : ""}`;
+
+          // Step 2: look those people up in batches of 50
+          const people: any[] = [];
+          for (let i = 0; i < ids.length; i += 50) {
+            const where = ids.slice(i, i + 50).map((id) => `Id == ${id}`).join(" || ");
+            const chunk = await rockSearch(env, "people", {
+              where,
+              select: "new { Id, FirstName, LastName, NickName, Email }",
+              limit: 50,
+            });
+            people.push(...chunk);
+          }
+          people.sort((a, b) => (a.lastName || "").localeCompare(b.lastName || ""));
+
+          const lines = people.map((p) => {
+            const name = `${p.nickName || p.firstName || ""} ${p.lastName || ""}`.trim();
+            return `- ${name}${p.email ? ` — ${p.email}` : ""}`;
           });
           const label = season === "24" ? "2026-27" : "2025-26";
           return {
-            content: [{ text: `${ensemble} — ${label} (${members.length} active):\n${lines.join("\n")}`, type: "text" }],
+            content: [{ text: `${ensemble} — ${label} (${people.length} active):\n${lines.join("\n")}`, type: "text" }],
           };
         } catch (err: any) {
           return { content: [{ text: `Error getting roster: ${err.message}`, type: "text" }] };
