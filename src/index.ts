@@ -20,6 +20,7 @@ const ENSEMBLE_BY_GROUP_ID: Record<number, string> = (() => {
   return m;
 })();
 const ANNUAL_ENROLLMENT_CATEGORY_ID = 305;
+const ENSEMBLE_GROUP_TYPES = [68, 69]; // 68 Elementary (Nova), 69 Middle/High (Cascadia/Pacific/Chamber)
 const orIds = (field: string, ids: number[]) => ids.slice(0, 50).map((id) => `${field} == ${id}`).join(" || ");
 const sum = (a: any[], f: (x: any) => number) => a.reduce((t, x) => t + (Number(f(x)) || 0), 0);
 
@@ -123,7 +124,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
     // --- Tool 4: tuition balance + payment-plan health ---
     this.server.tool(
       "rock_get_tuition_balance",
-      "Compute a PYC family's tuition balance (total due minus payments), including payment-plan details. Read-only. Discovers tuition templates by the Annual Enrollment category (new seasons auto-included). Matches a person as parent/registrar or singer/registrant.",
+      "Compute a PYC family's tuition balance (total due minus payments), including payment-plan details. Read-only. Discovers tuition templates by the Annual Enrollment category. Matches a person as parent/registrar or singer/registrant.",
       { query: z.string().min(2).describe("Name or email of a family member (parent or singer)") },
       async ({ query }) => {
         try {
@@ -215,7 +216,6 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
           if (templateIds.length === 0) return { content: [{ text: "No enrollment templates in the Annual Enrollment category.", type: "text" }] };
           const instances = await rockSearch(env, "registrationinstances", { where: `(${orIds("RegistrationTemplateId", templateIds)})`, select: "new { Id, Name, StartDateTime, EndDateTime, IsActive }", limit: 100 });
           if (instances.length === 0) return { content: [{ text: "No enrollment instances found.", type: "text" }] };
-
           if (instance && instance.trim() !== "") {
             const arg = instance.trim();
             const target = /^\d+$/.test(arg) ? instances.find((i) => i.id === Number(arg)) : instances.find((i) => String(i.name || "").toLowerCase().includes(arg.toLowerCase()));
@@ -243,7 +243,6 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
             }).sort();
             return { content: [{ text: `${target.name} — ${registrants.length} registrant(s), ${regIds.length} registration(s):\n${lines.join("\n")}`, type: "text" }] };
           }
-
           const out: string[] = [];
           for (const inst of instances.sort((a, b) => String(a.name).localeCompare(String(b.name)))) {
             const regs = await rockSearch(env, "registrations", { where: `RegistrationInstanceId == ${inst.id}`, select: "new { Id }", limit: 1000 });
@@ -257,6 +256,40 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
           }
           return { content: [{ text: `Enrollment instances:\n${out.join("\n")}`, type: "text" }] };
         } catch (e: any) { return { content: [{ text: `Error getting registrations: ${e.message}`, type: "text" }] }; }
+      },
+    );
+
+    // --- Tool 6: ensemble membership history ---
+    this.server.tool(
+      "rock_get_membership_history",
+      "Show a PYC person's ensemble membership history across seasons — current and prior groups (including archived), with join dates and status. Read-only. Covers the ensemble ladder (Elementary + Middle/High group types) for returning-vs-new and movement analysis.",
+      { query: z.string().min(2).describe("Name or email of the person") },
+      async ({ query }) => {
+        try {
+          const env = this.env as unknown as RockEnv;
+          const people = await resolvePerson(env, query);
+          if (people.length === 0) return { content: [{ text: `No person found matching "${query}".`, type: "text" }] };
+          if (people.length > 1) return { content: [{ text: `Multiple match "${query}":\n${people.map((p) => `- ${(p.nickName || p.firstName || "")} ${p.lastName || ""} (Id ${p.id})`).join("\n")}`, type: "text" }] };
+          const person = people[0];
+          const name = `${person.nickName || person.firstName || ""} ${person.lastName || ""}`.trim();
+          const mems = await rockSearch(env, "groupmembers", {
+            where: `PersonId == ${person.id} && (${orIds("GroupTypeId", ENSEMBLE_GROUP_TYPES)})`,
+            select: "new { GroupId, GroupMemberStatus, IsArchived, DateTimeAdded, CreatedDateTime }",
+            limit: 200,
+          });
+          if (mems.length === 0) return { content: [{ text: `No ensemble memberships found for ${name}.`, type: "text" }] };
+          const groupIds = [...new Set(mems.map((m) => m.groupId).filter(Boolean))];
+          const groupName: Record<number, string> = {};
+          for (let i = 0; i < groupIds.length; i += 50)
+            for (const g of await rockSearch(env, "groups", { where: orIds("Id", groupIds.slice(i, i + 50)), select: "new { Id, Name }", limit: 50 })) groupName[g.id] = g.name;
+          const rows = mems.map((m) => {
+            const joined = m.dateTimeAdded || m.createdDateTime;
+            const label = ENSEMBLE_BY_GROUP_ID[m.groupId] || groupName[m.groupId] || `Group ${m.groupId}`;
+            const status = m.isArchived ? "archived (prior season)" : m.groupMemberStatus === 1 ? "active" : m.groupMemberStatus === 0 ? "inactive" : m.groupMemberStatus === 2 ? "pending" : "—";
+            return { key: joined ? new Date(joined).getTime() : 0, line: `- ${joined ? String(joined).slice(0, 10) : "(no date)"} — ${label} — ${status}` };
+          }).sort((a, b) => a.key - b.key);
+          return { content: [{ text: `Ensemble history for ${name} (${mems.length} membership${mems.length === 1 ? "" : "s"}, oldest first):\n${rows.map((r) => r.line).join("\n")}`, type: "text" }] };
+        } catch (e: any) { return { content: [{ text: `Error getting membership history: ${e.message}`, type: "text" }] }; }
       },
     );
   }
