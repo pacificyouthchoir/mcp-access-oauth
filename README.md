@@ -1,208 +1,152 @@
-import OAuthProvider from "@cloudflare/workers-oauth-provider";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { McpAgent } from "agents/mcp";
-import { z } from "zod";
-import { handleAccessRequest } from "./access-handler";
-import type { Props } from "./workers-oauth-utils";
+# Model Context Protocol (MCP) Server + Access OAuth
 
-type RockEnv = { ROCK_BASE_URL: string; ROCK_API_KEY: string };
+This is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/introduction) server that supports remote MCP connections, with Access OAuth built-in.
 
-const GROUP_IDS: Record<string, Record<string, number>> = {
-  "23": { "nova 1": 2565, "nova 2": 2566, cascadia: 2567, pacific: 2568, chamber: 2571 },
-  "24": { "nova 1": 9322, "nova 2": 9323, cascadia: 9324, pacific: 9325, chamber: 9326 },
-};
-const ENSEMBLE_BY_GROUP_ID: Record<number, string> = (() => {
-  const m: Record<number, string> = {};
-  for (const s of Object.keys(GROUP_IDS)) {
-    const label = s === "24" ? "2026-27" : "2025-26";
-    for (const [n, id] of Object.entries(GROUP_IDS[s])) m[id] = `${n.replace(/\b\w/g, (c) => c.toUpperCase())} ${label}`;
-  }
-  return m;
-})();
+You can deploy it to your own Cloudflare account, and after you create your own Access for SaaS OIDC app, you'll have a fully functional remote MCP server that you can build off. Users will be able to connect to your MCP server by signing in with your connected Access Identity Provider.
 
-// Evergreen: tuition = registration templates in the "Annual Enrollment" category.
-// Old seasons age out to _Archive; new ones land here automatically. No yearly edits.
-const ANNUAL_ENROLLMENT_CATEGORY_ID = 305;
+The MCP server (powered by [Cloudflare Workers](https://developers.cloudflare.com/workers/)):
 
-const orIds = (field: string, ids: number[]) => ids.slice(0, 50).map((id) => `${field} == ${id}`).join(" || ");
-const sum = (a: any[], f: (x: any) => number) => a.reduce((t, x) => t + (Number(f(x)) || 0), 0);
+- Acts as OAuth _Server_ to your MCP clients
+- Acts as OAuth _Client_ to your _real_ OAuth server (in this case, Access)
 
-async function rockSearch(env: RockEnv, entity: string, body: unknown): Promise<any[]> {
-  const res = await fetch(`${env.ROCK_BASE_URL}/api/v2/models/${entity}/search`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization-Token": env.ROCK_API_KEY },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`Rock API ${res.status}: ${(await res.text()).slice(0, 300)}`);
-  const data: any = await res.json();
-  return Array.isArray(data) ? data : (data.items ?? data.Items ?? []);
-}
+## Getting Started
 
-async function resolvePerson(env: RockEnv, query: string) {
-  const q = query.replace(/["\\]/g, "").trim();
-  return rockSearch(env, "people", {
-    where: `FirstName.Contains("${q}") || LastName.Contains("${q}") || NickName.Contains("${q}") || Email.Contains("${q}")`,
-    select: "new { Id, FirstName, LastName, NickName, Email }",
-    limit: 10,
-  });
-}
+Clone the repo & install dependencies: `npm install`
 
-export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
-  server = new McpServer({ name: "PYC Rock MCP", version: "1.0.0" });
+### For Production
 
-  async init() {
-    // --- Tool 1: find a person ---
-    this.server.tool(
-      "rock_find_person",
-      "Search PYC's Rock database for people by name or email fragment. Read-only.",
-      { query: z.string().min(2).describe("Name or email fragment"), limit: z.number().int().min(1).max(50).default(10) },
-      async ({ query, limit }) => {
-        try {
-          const env = this.env as unknown as RockEnv;
-          const people = await resolvePerson(env, query);
-          if (people.length === 0) return { content: [{ text: `No people found matching "${query}".`, type: "text" }] };
-          const lines = people.slice(0, limit ?? 10).map((p) => `- ${(p.nickName || p.firstName || "")} ${p.lastName || ""} (Id ${p.id})${p.email ? ` — ${p.email}` : ""}`);
-          return { content: [{ text: `Found ${people.length} match(es):\n${lines.join("\n")}`, type: "text" }] };
-        } catch (e: any) { return { content: [{ text: `Error: ${e.message}`, type: "text" }] }; }
-      },
-    );
+Create a new [Access for SaaS OIDC App](https://developers.cloudflare.com/cloudflare-one/applications/configure-apps/saas-apps/generic-oidc-saas/):
 
-    // --- Tool 2: ensemble roster ---
-    this.server.tool(
-      "rock_get_roster",
-      "Get the active roster of a PYC ensemble for a season. Read-only.",
-      { ensemble: z.enum(["Nova 1", "Nova 2", "Cascadia", "Pacific", "Chamber"]), season: z.enum(["23", "24"]).default("24") },
-      async ({ ensemble, season }) => {
-        try {
-          const env = this.env as unknown as RockEnv;
-          const groupId = GROUP_IDS[season]?.[ensemble.toLowerCase()];
-          if (!groupId) return { content: [{ text: `No group ID for ${ensemble}/${season}.`, type: "text" }] };
-          const members = await rockSearch(env, "groupmembers", { where: `GroupId == ${groupId} && GroupMemberStatus == 1 && IsArchived == false`, select: "new { PersonId }", limit: 300 });
-          const ids = [...new Set(members.map((m) => m.personId).filter(Boolean))];
-          if (ids.length === 0) return { content: [{ text: `No active members in ${ensemble} (${season}).`, type: "text" }] };
-          const people: any[] = [];
-          for (let i = 0; i < ids.length; i += 50)
-            people.push(...(await rockSearch(env, "people", { where: orIds("Id", ids.slice(i, i + 50)), select: "new { Id, FirstName, LastName, NickName, Email }", limit: 50 })));
-          people.sort((a, b) => (a.lastName || "").localeCompare(b.lastName || ""));
-          const lines = people.map((p) => `- ${(p.nickName || p.firstName || "")} ${p.lastName || ""}${p.email ? ` — ${p.email}` : ""}`);
-          const label = season === "24" ? "2026-27" : "2025-26";
-          return { content: [{ text: `${ensemble} — ${label} (${people.length}):\n${lines.join("\n")}`, type: "text" }] };
-        } catch (e: any) { return { content: [{ text: `Error: ${e.message}`, type: "text" }] }; }
-      },
-    );
+- For the Authorization callback URL, specify `https://mcp-access-oauth.<your-subdomain>.workers.dev/callback` and `http://localhost:8788/callback` if you are developing locally.
+- Note your Client ID and Client secret.
+- Set secrets via Wrangler
 
-    // --- Tool 3: recent attendance ---
-    this.server.tool(
-      "rock_get_person_attendance",
-      "Show a PYC person's recent attendance (present/absent) with dates and ensemble. Read-only.",
-      { query: z.string().min(2), limit: z.number().int().min(1).max(50).default(10) },
-      async ({ query, limit }) => {
-        try {
-          const env = this.env as unknown as RockEnv;
-          const people = await resolvePerson(env, query);
-          if (people.length === 0) return { content: [{ text: `No person found matching "${query}".`, type: "text" }] };
-          if (people.length > 1) return { content: [{ text: `Multiple match "${query}":\n${people.map((p) => `- ${(p.nickName || p.firstName || "")} ${p.lastName || ""} (Id ${p.id})`).join("\n")}`, type: "text" }] };
-          const person = people[0];
-          const name = `${person.nickName || person.firstName || ""} ${person.lastName || ""}`.trim();
-          const aliases = await rockSearch(env, "personaliases", { where: `PersonId == ${person.id}`, select: "new { Id }", limit: 50 });
-          const aliasIds = aliases.map((a) => a.id).filter(Boolean);
-          if (aliasIds.length === 0) return { content: [{ text: `No attendance for ${name}.`, type: "text" }] };
-          const rows = await rockSearch(env, "attendances", { where: orIds("PersonAliasId", aliasIds), select: "new { DidAttend, StartDateTime, OccurrenceId }", sort: "StartDateTime desc", limit: limit ?? 10 });
-          if (rows.length === 0) return { content: [{ text: `No attendance for ${name}.`, type: "text" }] };
-          const occMap: Record<number, number> = {};
-          try {
-            const occIds = [...new Set(rows.map((r) => r.occurrenceId).filter(Boolean))];
-            if (occIds.length) for (const o of await rockSearch(env, "attendanceoccurrences", { where: orIds("Id", occIds), select: "new { Id, GroupId }", limit: 50 })) occMap[o.id] = o.groupId;
-          } catch {}
-          const lines = rows.map((r) => {
-            const date = r.startDateTime ? String(r.startDateTime).slice(0, 10) : "(no date)";
-            const status = r.didAttend === true ? "Present" : r.didAttend === false ? "Absent" : "—";
-            const ens = ENSEMBLE_BY_GROUP_ID[occMap[r.occurrenceId]] ? ` — ${ENSEMBLE_BY_GROUP_ID[occMap[r.occurrenceId]]}` : "";
-            return `- ${date} — ${status}${ens}`;
-          });
-          return { content: [{ text: `Recent attendance for ${name} (last ${rows.length}):\n${lines.join("\n")}`, type: "text" }] };
-        } catch (e: any) { return { content: [{ text: `Error: ${e.message}`, type: "text" }] }; }
-      },
-    );
+```bash
+wrangler secret put ACCESS_CLIENT_ID
+wrangler secret put ACCESS_CLIENT_SECRET
+wrangler secret put ACCESS_TOKEN_URL
+wrangler secret put ACCESS_AUTHORIZATION_URL
+wrangler secret put ACCESS_JWKS_URL
+wrangler secret put COOKIE_ENCRYPTION_KEY # add any random string here e.g. openssl rand -hex 32
+```
 
-    // --- Tool 4: tuition balance (category-driven / evergreen) ---
-    // VALIDATE against Singer Dashboard before trusting the numbers.
-    this.server.tool(
-      "rock_get_tuition_balance",
-      "Compute a PYC family's tuition balance (total due minus payments). Read-only. Discovers tuition registrations by the Annual Enrollment template category, so new seasons work automatically. Matches a person as parent/registrar or singer/registrant.",
-      { query: z.string().min(2).describe("Name or email of a family member (parent or singer)") },
-      async ({ query }) => {
-        try {
-          const env = this.env as unknown as RockEnv;
+#### Set up a KV namespace
 
-          // 0) discover current tuition templates by category (evergreen)
-          const templates = await rockSearch(env, "registrationtemplates", { where: `CategoryId == ${ANNUAL_ENROLLMENT_CATEGORY_ID}`, select: "new { Id, Name }", limit: 50 });
-          const templateIds = templates.map((t) => t.id).filter(Boolean);
-          const templateName: Record<number, string> = {};
-          for (const t of templates) templateName[t.id] = t.name;
-          if (templateIds.length === 0) return { content: [{ text: `No tuition templates found in the Annual Enrollment category.`, type: "text" }] };
+- Create the KV namespace:
+  `wrangler kv:namespace create "OAUTH_KV"`
+- Update the Wrangler file with the KV ID
 
-          const people = await resolvePerson(env, query);
-          if (people.length === 0) return { content: [{ text: `No person found matching "${query}".`, type: "text" }] };
-          if (people.length > 1) return { content: [{ text: `Multiple match "${query}" — narrow it:\n${people.map((p) => `- ${(p.nickName || p.firstName || "")} ${p.lastName || ""} (Id ${p.id})`).join("\n")}`, type: "text" }] };
-          const person = people[0];
-          const name = `${person.nickName || person.firstName || ""} ${person.lastName || ""}`.trim();
+#### Deploy & Test
 
-          const aliases = await rockSearch(env, "personaliases", { where: `PersonId == ${person.id}`, select: "new { Id }", limit: 50 });
-          const aliasIds = aliases.map((a) => a.id).filter(Boolean);
-          if (aliasIds.length === 0) return { content: [{ text: `No tuition registrations found for ${name}.`, type: "text" }] };
+Deploy the MCP server to make it available on your workers.dev domain
+` wrangler deploy`
 
-          const asRegistrar = await rockSearch(env, "registrations", { where: `(${orIds("PersonAliasId", aliasIds)})`, select: "new { Id }", limit: 100 });
-          const asRegistrant = await rockSearch(env, "registrationregistrants", { where: `(${orIds("PersonAliasId", aliasIds)})`, select: "new { RegistrationId }", limit: 200 });
-          const regIds = [...new Set([...asRegistrar.map((r) => r.id), ...asRegistrant.map((r) => r.registrationId)].filter(Boolean))];
-          if (regIds.length === 0) return { content: [{ text: `No tuition registrations found for ${name}.`, type: "text" }] };
+Test the remote server using [Inspector](https://modelcontextprotocol.io/docs/tools/inspector):
 
-          const regs: any[] = [];
-          for (let i = 0; i < regIds.length; i += 50)
-            regs.push(...(await rockSearch(env, "registrations", { where: `(${orIds("Id", regIds.slice(i, i + 50))}) && (${orIds("RegistrationTemplateId", templateIds)})`, select: "new { Id, RegistrationTemplateId, DiscountAmount, DiscountPercentage, FirstName, LastName }", limit: 100 })));
-          if (regs.length === 0) return { content: [{ text: `No current tuition registrations found for ${name}.`, type: "text" }] };
+```
+npx @modelcontextprotocol/inspector@latest
+```
 
-          const etype = await rockSearch(env, "entitytypes", { where: `Name == "Rock.Model.Registration"`, select: "new { Id }", limit: 1 });
-          const regTypeId = etype[0]?.id;
+Enter `https://mcp-access-oauth.<your-subdomain>.workers.dev/mcp` and hit connect. Once you go through the authentication flow, you'll see the Tools working:
 
-          const out: string[] = [];
-          let familyBalance = 0;
-          for (const reg of regs) {
-            const registrants = await rockSearch(env, "registrationregistrants", { where: `RegistrationId == ${reg.id}`, select: "new { Id, Cost, DiscountApplies }", limit: 100 });
-            const registrantIds = registrants.map((r) => r.id).filter(Boolean);
-            let feeSum = 0;
-            if (registrantIds.length) {
-              const fees = await rockSearch(env, "registrationregistrantfees", { where: `(${orIds("RegistrationRegistrantId", registrantIds)})`, select: "new { Cost, Quantity }", limit: 200 });
-              feeSum = sum(fees, (f) => (Number(f.cost) || 0) * (Number(f.quantity) || 0));
-            }
-            const gross = sum(registrants, (r) => r.cost) + feeSum;
-            const eligible = registrants.filter((r) => r.discountApplies === true).length;
-            const discount = (Number(reg.discountAmount) || 0) * eligible + gross * (Number(reg.discountPercentage) || 0);
-            const totalDue = gross - discount;
+<img width="640" alt="image" src="https://github.com/user-attachments/assets/7973f392-0a9d-4712-b679-6dd23f824287" />
 
-            let paid = 0;
-            if (regTypeId) {
-              const details = await rockSearch(env, "financialtransactiondetails", { where: `EntityTypeId == ${regTypeId} && EntityId == ${reg.id}`, select: "new { Amount }", limit: 500 });
-              paid = sum(details, (d) => d.amount);
-            }
-            const balance = totalDue - paid;
-            familyBalance += balance;
-            const label = templateName[reg.registrationTemplateId] || `template ${reg.registrationTemplateId}`;
-            const paidFull = balance <= 5 ? " ✓ paid in full" : "";
-            out.push(`• Reg ${reg.id} — ${label} (${reg.firstName || ""} ${reg.lastName || ""}): due $${totalDue.toFixed(2)}, paid $${paid.toFixed(2)}, balance $${balance.toFixed(2)}${paidFull}`);
-          }
-          return { content: [{ text: `Tuition for ${name}:\n${out.join("\n")}\n\nFamily balance: $${familyBalance.toFixed(2)}`, type: "text" }] };
-        } catch (e: any) { return { content: [{ text: `Error getting tuition balance: ${e.message}`, type: "text" }] }; }
-      },
-    );
+You now have a remote MCP server deployed!
+
+### Access Control
+
+This MCP server uses Access for authentication. All authenticated Access users can access basic tools like "add".
+
+The "generateImage" tool is restricted to specific Access users listed in the `ALLOWED_USERNAMES` configuration:
+
+```typescript
+// Add user emails for image generation access
+const ALLOWED_EMAILS = new Set(["employee1@mycompany.com", "teammate1@mycompany.com"]);
+```
+
+### Access the remote MCP server from Claude Desktop
+
+Open Claude Desktop and navigate to Settings -> Developer -> Edit Config. This opens the configuration file that controls which MCP servers Claude can access.
+
+Replace the content with the following configuration. Once you restart Claude Desktop, a browser window will open showing your OAuth login page. Complete the authentication flow to grant Claude access to your MCP server. After you grant access, the tools will become available for you to use.
+
+```
+{
+  "mcpServers": {
+    "math": {
+      "command": "npx",
+      "args": [
+        "mcp-remote",
+        "https://mcp-access-oauth.<your-subdomain>.workers.dev/mcp"
+      ]
+    }
   }
 }
+```
 
-export default new OAuthProvider({
-  apiHandler: MyMCP.serve("/mcp"),
-  apiRoute: "/mcp",
-  authorizeEndpoint: "/authorize",
-  clientRegistrationEndpoint: "/register",
-  defaultHandler: { fetch: handleAccessRequest as any },
-  tokenEndpoint: "/token",
-});
+Once the Tools (under 🔨) show up in the interface, you can ask Claude to use them. For example: "Could you use the math tool to add 23 and 19?". Claude should invoke the tool and show the result generated by the MCP server.
+
+### For Local Development
+
+If you'd like to iterate and test your MCP server, you can do so in local development.
+
+- For the Homepage URL, specify `http://localhost:8788`
+- For the Authorization callback URL, specify `http://localhost:8788/callback`
+- Note your Client ID and generate a Client secret.
+- Create a `.dev.vars` file in your project root with:
+
+```
+ACCESS_CLIENT_ID=<your client id>
+ACCESS_CLIENT_SECRET=<your client secret>
+ACCESS_TOKEN_URL=<your Access for SaaS token url>
+ACCESS_AUTHORIZATION_URL=<your Access for SaaS authorization url>
+ACCESS_JWKS_URL=<your Access for SaaS JWKS url>
+COOKIE_ENCRYPTION_KEY=COOKIE_ENCRYPTION_KEY
+```
+
+#### Develop & Test
+
+Run the server locally to make it available at `http://localhost:8788`
+`wrangler dev`
+
+To test the local server, enter `http://localhost:8788/mcp` into Inspector and hit connect. Once you follow the prompts, you'll be able to "List Tools".
+
+#### Using Claude and other MCP Clients
+
+When using Claude to connect to your remote MCP server, you may see some error messages. This is because Claude Desktop doesn't yet support remote MCP servers, so it sometimes gets confused. To verify whether the MCP server is connected, hover over the 🔨 icon in the bottom right corner of Claude's interface. You should see your tools available there.
+
+#### Using Cursor and other MCP Clients
+
+To connect Cursor with your MCP server, choose `Type`: "Command" and in the `Command` field, combine the command and args fields into one (e.g. `npx mcp-remote https://<your-worker-name>.<your-subdomain>.workers.dev/mcp`).
+
+Note that while Cursor supports HTTP+SSE servers, it doesn't support authentication, so you still need to use `mcp-remote` (and to use a STDIO server, not an HTTP one).
+
+You can connect your MCP server to other MCP clients like Windsurf by opening the client's configuration file, adding the same JSON that was used for the Claude setup, and restarting the MCP client.
+
+## How does it work?
+
+#### OAuth Provider
+
+The OAuth Provider library serves as a complete OAuth 2.1 server implementation for Cloudflare Workers. It handles the complexities of the OAuth flow, including token issuance, validation, and management. In this project, it plays the dual role of:
+
+- Authenticating MCP clients that connect to your server
+- Managing the connection to Access's OAuth services
+- Securely storing tokens and authentication state in KV storage
+
+#### Durable MCP
+
+Durable MCP extends the base MCP functionality with Cloudflare's Durable Objects, providing:
+
+- Persistent state management for your MCP server
+- Secure storage of authentication context between requests
+- Access to authenticated user information via `this.props`
+- Support for conditional tool availability based on user identity
+
+#### MCP Remote
+
+The MCP Remote library enables your server to expose tools that can be invoked by MCP clients like the Inspector. It:
+
+- Defines the protocol for communication between clients and your server
+- Provides a structured way to define tools
+- Handles serialization and deserialization of requests and responses
+- Maintains the Server-Sent Events (SSE) connection between clients and your server
