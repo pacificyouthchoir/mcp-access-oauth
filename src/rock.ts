@@ -90,3 +90,11 @@ export async function resolvePerson(env: RockEnv, query: string) {
     limit: 10,
   });
 }
+
+export async function rockGet(env: RockEnv, path: string): Promise<any> {
+  const res = await fetch(`${env.ROCK_BASE_URL}${path}`, {
+    headers: { "Authorization-Token": env.ROCK_API_KEY },
+  });
+  if (!res.ok) throw new Error(`Rock API ${res.status}: ${(await res.text()).slice(0, 300)}`);
+  return res.json();
+}
