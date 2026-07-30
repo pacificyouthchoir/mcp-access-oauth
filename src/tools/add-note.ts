@@ -56,6 +56,7 @@ export function registerAddNote(server: McpServer, getEnv: () => RockEnv, getPro
 
         const caption = "Added via Claude";
         const body: Record<string, unknown> = {
+          isSystem: false,
           noteTypeId: noteType.id,
           entityId: person.id,
           text,
