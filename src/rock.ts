@@ -32,10 +32,51 @@ export async function rockSearch(env: RockEnv, entity: string, body: unknown): P
 }
 
 export async function resolvePerson(env: RockEnv, query: string) {
-  const q = query.replace(/["\\]/g, "").trim();
+  const raw = String(query || "").trim();
+  const SELECT = "new { Id, FirstName, LastName, NickName, Email }";
+
+  // 1) Explicit Id — "1", "id:1", "#1", or "...(Id 1)"
+  const idMatch =
+    raw.match(/^\s*(?:id[:\s]*|#)?(\d{1,9})\s*$/i) ||
+    raw.match(/\(\s*id\s*[:\s]?\s*(\d{1,9})\s*\)/i);
+  if (idMatch) {
+    const byId = await rockSearch(env, "people", {
+      where: `Id == ${Number(idMatch[1])}`,
+      select: SELECT,
+      limit: 1,
+    });
+    if (byId.length) return byId;
+  }
+
+  const q = raw.replace(/["\\]/g, "").trim();
+
+  // 2) Full name — "Andrew Hansen" or "Hansen, Andrew"
+  let first = "";
+  let last = "";
+  if (q.includes(",")) {
+    const [l, f] = q.split(",").map((s) => s.trim());
+    last = l;
+    first = f || "";
+  } else {
+    const parts = q.split(/\s+/).filter(Boolean);
+    if (parts.length >= 2) {
+      first = parts[0];
+      last = parts[parts.length - 1];
+    }
+  }
+  if (first && last) {
+    const byName = await rockSearch(env, "people", {
+      where: `(FirstName.Contains("${first}") || NickName.Contains("${first}")) && LastName.Contains("${last}")`,
+      select: SELECT,
+      limit: 10,
+    });
+    if (byName.length) return byName;
+  }
+
+  // 3) Single-token fallback — name or email fragment
   return rockSearch(env, "people", {
     where: `FirstName.Contains("${q}") || LastName.Contains("${q}") || NickName.Contains("${q}") || Email.Contains("${q}")`,
-    select: "new { Id, FirstName, LastName, NickName, Email }",
+    select: SELECT,
     limit: 10,
   });
 }
