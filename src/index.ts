@@ -16,6 +16,7 @@ import { registerNotes } from "./tools/notes";
 import { registerAddNote } from "./tools/add-note";
 import { registerCommunications } from "./tools/communications";
 import { registerDataView } from "./tools/dataview";
+import { registerPersonCommunications } from "./tools/person-communications";
 
 export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
   server = new McpServer({ name: "PYC Rock MCP", version: "1.0.0" });
@@ -34,6 +35,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
     registerAddNote(this.server, getEnv, () => (this as any).props);
     registerCommunications(this.server, getEnv);
     registerDataView(this.server, getEnv);
+    registerPersonCommunications(this.server, getEnv);
   }
 }
 
