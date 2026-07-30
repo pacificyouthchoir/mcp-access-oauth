@@ -1,7 +1,17 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
-export type RockEnv = { ROCK_BASE_URL: string; ROCK_API_KEY: string };
+export type RockEnv = { ROCK_BASE_URL: string; ROCK_API_KEY: string; ROCK_WRITE_API_KEY?: string };
 export type ToolRegistrar = (server: McpServer, getEnv: () => RockEnv) => void;
+
+export async function rockPost(env: RockEnv, path: string, body: unknown): Promise<{ ok: boolean; status: number; text: string }> {
+  const key = env.ROCK_WRITE_API_KEY || env.ROCK_API_KEY;
+  const res = await fetch(`${env.ROCK_BASE_URL}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization-Token": key },
+    body: JSON.stringify(body),
+  });
+  return { ok: res.ok, status: res.status, text: await res.text() };
+}
 
 export const GROUP_IDS: Record<string, Record<string, number>> = {
   "23": { "nova 1": 2565, "nova 2": 2566, cascadia: 2567, pacific: 2568, chamber: 2571 },
