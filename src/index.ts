@@ -12,6 +12,7 @@ import { registerRegistrations } from "./tools/registrations";
 import { registerPersonGroups } from "./tools/person-groups";
 import { registerGroupMembers } from "./tools/group-members";
 import { registerAttributes } from "./tools/attributes";
+import { registerNotes } from "./tools/notes";
 
 export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
   server = new McpServer({ name: "PYC Rock MCP", version: "1.0.0" });
@@ -26,6 +27,7 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
     registerPersonGroups(this.server, getEnv);
     registerGroupMembers(this.server, getEnv);
     registerAttributes(this.server, getEnv);
+    registerNotes(this.server, getEnv);
   }
 }
 
