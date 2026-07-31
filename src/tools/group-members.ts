@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { RockEnv, rockSearch, orIds } from "../rock";
+import { RockEnv, rockSearch, orIds, resolveGroup } from "../rock";
 
 export function registerGroupMembers(server: McpServer, getEnv: () => RockEnv) {
   server.tool(
@@ -10,21 +10,13 @@ export function registerGroupMembers(server: McpServer, getEnv: () => RockEnv) {
     async ({ group }) => {
       try {
         const env = getEnv();
-        const q = group.replace(/["\\]/g, "").trim();
-        const matches = await rockSearch(env, "groups", { where: `Name.Contains("${q}")`, select: "new { Id, Name, GroupTypeId, IsActive, IsArchived }", limit: 50 });
-        if (matches.length === 0) return { content: [{ text: `No group matching "${group}".`, type: "text" }] };
-        const active = matches.filter((g) => g.isActive === true && g.isArchived !== true);
-        let target: any;
-        let note = "";
-        if (active.length === 1) {
-          target = active[0];
-          const others = matches.filter((g) => g.id !== target.id);
-          if (others.length) note = `\n(also matched: ${others.map((g) => `${g.name} [Id ${g.id}${g.isArchived ? ", archived" : g.isActive ? "" : ", inactive"}]`).join("; ")})`;
-        } else if (active.length > 1) {
-          return { content: [{ text: `Several active groups match "${group}" — which one?\n${active.map((g) => `- ${g.name} (Id ${g.id})`).join("\n")}`, type: "text" }] };
-        } else {
-          return { content: [{ text: `No *active* group matches "${group}", but these exist:\n${matches.map((g) => `- ${g.name} (Id ${g.id}${g.isArchived ? ", archived" : ", inactive"})`).join("\n")}\nAsk again with a more specific name.`, type: "text" }] };
-        }
+        const res = await resolveGroup(env, group);
+        if (res.matches.length === 0) return { content: [{ text: `No group matching "${group}".`, type: "text" }] };
+        if (!res.target)
+          return { content: [{ text: `Several groups match "${group}" — re-run with the Id:\n${res.enriched.join("\n")}`, type: "text" }] };
+        const target = res.target;
+        const note = "";
+        
         let typeLabel = "";
         try {
           const t = (await rockSearch(env, "grouptypes", { where: `Id == ${target.groupTypeId}`, select: "new { Name }", limit: 1 }))[0];
