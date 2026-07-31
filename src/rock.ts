@@ -98,3 +98,54 @@ export async function rockGet(env: RockEnv, path: string): Promise<any> {
   if (!res.ok) throw new Error(`Rock API ${res.status}: ${(await res.text()).slice(0, 300)}`);
   return res.json();
 }
+
+export type ResolvedGroup = { target?: any; matches: any[]; enriched: string[] };
+
+export async function resolveGroup(env: RockEnv, query: string): Promise<ResolvedGroup> {
+  const raw = String(query || "").trim();
+  const SELECT = "new { Id, Name, GroupTypeId, ParentGroupId, IsActive, IsArchived }";
+
+  // 1) explicit Id — "2567", "id:2567", "#2567", or "...(Id 2567)"
+  const idMatch =
+    raw.match(/^\s*(?:id[:\s]*|#)?(\d{1,9})\s*$/i) || raw.match(/\(\s*id\s*[:\s]?\s*(\d{1,9})\s*\)/i);
+  if (idMatch) {
+    const byId = await rockSearch(env, "groups", { where: `Id == ${Number(idMatch[1])}`, select: SELECT, limit: 1 });
+    if (byId.length) return { target: byId[0], matches: byId, enriched: [] };
+  }
+
+  const q = raw.replace(/["\\]/g, "").trim();
+  const matches = await rockSearch(env, "groups", { where: `Name.Contains("${q}")`, select: SELECT, limit: 50 });
+  if (matches.length === 0) return { matches: [], enriched: [] };
+
+  const active = matches.filter((g) => g.isActive === true && g.isArchived !== true);
+  const pool = active.length ? active : matches;
+  if (pool.length === 1) return { target: pool[0], matches, enriched: [] };
+
+  // enrich for disambiguation: parent group (season anchor) + group type
+  const parentIds = [...new Set(pool.map((g) => g.parentGroupId).filter(Boolean))];
+  const parentName: Record<number, string> = {};
+  for (let i = 0; i < parentIds.length; i += 50)
+    for (const p of await rockSearch(env, "groups", { where: orIds("Id", parentIds.slice(i, i + 50)), select: "new { Id, Name }", limit: 50 }))
+      parentName[p.id] = p.name;
+  const typeIds = [...new Set(pool.map((g) => g.groupTypeId).filter(Boolean))];
+  const typeName: Record<number, string> = {};
+  for (let i = 0; i < typeIds.length; i += 50)
+    for (const t of await rockSearch(env, "grouptypes", { where: orIds("Id", typeIds.slice(i, i + 50)), select: "new { Id, Name }", limit: 50 }))
+      typeName[t.id] = t.name;
+
+  // highest ParentGroupId ≈ most recent season
+  const maxParent = Math.max(...pool.map((g) => g.parentGroupId || 0));
+  const enriched = pool
+    .sort((a, b) => (b.parentGroupId || 0) - (a.parentGroupId || 0))
+    .map((g) => {
+      const parts: string[] = [];
+      if (parentName[g.parentGroupId]) parts.push(`under ${parentName[g.parentGroupId]}`);
+      if (typeName[g.groupTypeId]) parts.push(typeName[g.groupTypeId]);
+      if (!g.isActive) parts.push("inactive");
+      if (g.isArchived) parts.push("archived");
+      const current = g.parentGroupId === maxParent && maxParent > 0 ? "  ← likely current season" : "";
+      return `- ${g.name} (Id ${g.id})${parts.length ? ` — ${parts.join(", ")}` : ""}${current}`;
+    });
+
+  return { matches, enriched };
+}
