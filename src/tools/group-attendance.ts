@@ -1,30 +1,24 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { RockEnv, rockSearch, orIds } from "../rock";
+import { RockEnv, rockSearch, orIds, resolveGroup } from "../rock";
 
 export function registerGroupAttendance(server: McpServer, getEnv: () => RockEnv) {
   server.tool(
     "rock_get_group_attendance",
     "Attendance for ANY PYC group or event by name — rehearsals, retreats, gala, dress rehearsals, volunteer teams. Read-only. With no date, returns recent occurrences with turnout counts; with a date, returns who was present and who was absent that day.",
     {
-      group: z.string().min(2).describe("Group/event name fragment, e.g. 'Cascadia', 'gala', 'retreat'"),
-      date: z.string().optional().describe("Optional: a specific occurrence date, YYYY-MM-DD. Omit for a turnout summary."),
+      group: z.string().min(2).describe("Group/event name fragment or Rock group Id, e.g. 'Cascadia', 'gala', '9324'"),      date: z.string().optional().describe("Optional: a specific occurrence date, YYYY-MM-DD. Omit for a turnout summary."),
       occurrences: z.number().int().min(1).max(20).default(6).describe("How many recent occurrences to summarize (default 6)"),
     },
     async ({ group, date, occurrences }) => {
       try {
         const env = getEnv();
-        const q = group.replace(/["\\]/g, "").trim();
-        const matches = await rockSearch(env, "groups", { where: `Name.Contains("${q}")`, select: "new { Id, Name, IsActive, IsArchived }", limit: 50 });
-        if (matches.length === 0) return { content: [{ text: `No group matching "${group}".`, type: "text" }] };
-        const active = matches.filter((g) => g.isActive === true && g.isArchived !== true);
-        let target: any;
-        if (active.length === 1) target = active[0];
-        else if (active.length > 1)
-          return { content: [{ text: `Several active groups match "${group}" — which one?\n${active.map((g) => `- ${g.name} (Id ${g.id})`).join("\n")}`, type: "text" }] };
-        else
-          return { content: [{ text: `No active group matches "${group}". These exist:\n${matches.map((g) => `- ${g.name} (Id ${g.id}${g.isArchived ? ", archived" : ", inactive"})`).join("\n")}`, type: "text" }] };
-
+        const res = await resolveGroup(env, group);
+        if (res.matches.length === 0) return { content: [{ text: `No group matching "${group}".`, type: "text" }] };
+        if (!res.target)
+          return { content: [{ text: `Several groups match "${group}" — re-run with the Id:\n${res.enriched.join("\n")}`, type: "text" }] };
+        const target = res.target;
+        
         const occs = await rockSearch(env, "attendanceoccurrences", {
           where: `GroupId == ${target.id}`,
           select: "new { Id, OccurrenceDate, DidNotOccur, Notes }",
